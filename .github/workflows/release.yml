@@ -1,6 +1,19 @@
-name: release
+name: Release
+
 on:
   workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version'
+        required: true
+      tag:
+        description: 'Tag'
+        required: true
+  push:
+    tags:
+      - 'v*'
+  release:
+    types: [created]
 
 jobs:
   build:
@@ -8,291 +21,235 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Windows
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            binary: lightningcss.exe
+            libc: ""
+            target_dir: target/x86_64-pc-windows-msvc/release
+            bin_ext: .exe
+            artifact_name: win32-x64
           - os: windows-latest
             target: aarch64-pc-windows-msvc
-            binary: lightningcss.exe
-          # Mac OS
+            libc: ""
+            target_dir: target/aarch64-pc-windows-msvc/release
+            bin_ext: .exe
+            artifact_name: win32-arm64
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            libc: ""
+            target_dir: target/x86_64-unknown-linux-gnu/release
+            bin_ext: ""
+            artifact_name: linux-x64
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            libc: ""
+            target_dir: target/aarch64-unknown-linux-gnu/release
+            bin_ext: ""
+            artifact_name: linux-arm64
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            libc: musl
+            target_dir: target/x86_64-unknown-linux-musl/release
+            bin_ext: ""
+            artifact_name: linux-musl-x64
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            libc: musl
+            target_dir: target/aarch64-unknown-linux-musl/release
+            bin_ext: ""
+            artifact_name: linux-musl-arm64
           - os: macos-latest
             target: x86_64-apple-darwin
-            strip: strip -x # Must use -x on macOS. This produces larger results on linux.
-            binary: lightningcss
+            libc: ""
+            target_dir: target/x86_64-apple-darwin/release
+            bin_ext: ""
+            artifact_name: darwin-x64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            libc: ""
+            target_dir: target/aarch64-apple-darwin/release
+            bin_ext: ""
+            artifact_name: darwin-arm64
+          # Target Android aarch64 (arm64)
+          - os: ubuntu-latest
+            target: aarch64-linux-android
+            libc: ""
+            target_dir: target/aarch64-linux-android/release
+            bin_ext: ""
+            artifact_name: android-arm64
+          # Target Android armv7 (arm)
+          - os: ubuntu-latest
+            target: armv7-linux-androideabi
+            libc: ""
+            target_dir: target/armv7-linux-androideabi/release
+            bin_ext: ""
+            artifact_name: android-arm
 
-    name: build-${{ matrix.target }}
+    name: Building ${{ matrix.artifact_name }}
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v3
-      - name: Install Node.JS
-        uses: actions/setup-node@v3
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
         with:
           node-version: 18
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
 
-      - name: Setup rust target
-        run: rustup target add ${{ matrix.target }}
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
 
-      - uses: bahmutov/npm-install@v1.8.32
-      - name: Build release
-        run: yarn build-release
-        env:
-          RUST_TARGET: ${{ matrix.target }}
-      - name: Build CLI
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Setup Android NDK
+        if: contains(matrix.target, 'android')
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r25b
+          add-to-path: false
+
+      - name: Set Android ENV for aarch64
+        if: matrix.target == 'aarch64-linux-android'
         run: |
-          cargo build --release --features cli --target ${{ matrix.target }}
-          node -e "require('fs').renameSync('target/${{ matrix.target }}/release/${{ matrix.binary }}', '${{ matrix.binary }}')"
-      - name: Strip debug symbols # https://github.com/rust-lang/rust/issues/46034
-        if: ${{ matrix.strip }}
-        run: ${{ matrix.strip }} *.node ${{ matrix.binary }}
-      - name: Upload artifacts
+          echo "ANDROID_NDK_HOME=${{ steps.setup-ndk.outputs.ndk-path }}" >> $GITHUB_ENV
+          echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang" >> $GITHUB_ENV
+
+      - name: Set Android ENV for armv7
+        if: matrix.target == 'armv7-linux-androideabi'
+        run: |
+          echo "ANDROID_NDK_HOME=${{ steps.setup-ndk.outputs.ndk-path }}" >> $GITHUB_ENV
+          echo "CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER=${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi24-clang" >> $GITHUB_ENV
+
+      - name: Install musl-gcc
+        if: matrix.libc == 'musl'
+        run: sudo apt-get install -y musl-tools
+
+      - name: Install yarn
+        run: npm install -g yarn
+
+      - name: Install dependencies
+        run: yarn install
+
+      - name: Set version
+        run: node scripts/set-version.js
+        env:
+          VERSION: ${{ github.event.inputs.version || github.ref_name }}
+
+      - name: Build
+        if: "!contains(matrix.artifact_name, 'android')"
+        run: yarn build -t ${{ matrix.target }}
+        env:
+          MACOSX_DEPLOYMENT_TARGET: '10.13'
+
+      - name: Build Android arm64
+        if: matrix.artifact_name == 'android-arm64'
+        run: yarn napi build --bin lightningcss --platform --release --features cli --target aarch64-linux-android
+
+      - name: Build Android arm
+        if: matrix.artifact_name == 'android-arm'
+        run: yarn napi build --bin lightningcss --platform --release --features cli --target armv7-linux-androideabi
+
+      - name: List files
+        run: |
+          echo "Target directory contents:"
+          ls -la ${{ matrix.target_dir }} || true
+          echo "Current directory contents:"
+          ls -la . || true
+          echo "Node addon file:"
+          find . -name "lightningcss.${{ matrix.artifact_name }}.node" || true
+
+      - name: Upload binary artifact
         uses: actions/upload-artifact@v4
         with:
-          name: bindings-${{ matrix.target }}
-          path: |
-            *.node
-            ${{ matrix.binary }}
+          name: lightningcss-bin-${{ matrix.artifact_name }}
+          path: ${{ matrix.target_dir }}/lightningcss${{ matrix.bin_ext }}
 
-  build-apple-silicon:
-    name: build-apple-silicon
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v3
-      - name: Install Node.JS
-        uses: actions/setup-node@v3
-        with:
-          node-version: 18
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Setup rust target
-        run: rustup target add aarch64-apple-darwin
-
-      - uses: bahmutov/npm-install@v1.8.32
-      - name: Build release
-        run: yarn build-release
-        env:
-          RUST_TARGET: aarch64-apple-darwin
-          JEMALLOC_SYS_WITH_LG_PAGE: 14
-      - name: Build CLI
-        run: |
-          export CC=$(xcrun -f clang);
-          export CXX=$(xcrun -f clang++);
-          SYSROOT=$(xcrun --sdk macosx --show-sdk-path);
-          export CFLAGS="-isysroot $SYSROOT -isystem $SYSROOT";
-          export MACOSX_DEPLOYMENT_TARGET="10.9";
-          cargo build --release --features cli --target aarch64-apple-darwin
-          mv target/aarch64-apple-darwin/release/lightningcss lightningcss
-        env:
-          JEMALLOC_SYS_WITH_LG_PAGE: 14
-      - name: Strip debug symbols # https://github.com/rust-lang/rust/issues/46034
-        run: strip -x *.node lightningcss
-      - name: Upload artifacts
+      - name: Upload node addon artifact
         uses: actions/upload-artifact@v4
         with:
-          name: bindings-aarch64-apple-darwin
-          path: |
-            *.node
-            lightningcss
+          name: lightningcss-addon-${{ matrix.artifact_name }}
+          path: lightningcss.${{ matrix.artifact_name }}.node
 
-  build-linux:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            strip: strip
-            image: ghcr.io/napi-rs/napi-rs/nodejs-rust:lts-debian
-            setup: npm install --global yarn@1
-          - target: aarch64-unknown-linux-gnu
-            strip: llvm-strip
-            image: ghcr.io/napi-rs/napi-rs/nodejs-rust:lts-debian-aarch64
-          - target: armv7-unknown-linux-gnueabihf
-            strip: llvm-strip
-            image: ghcr.io/napi-rs/napi-rs/nodejs-rust@sha256:c22284b2d79092d3e885f64ede00f6afdeb2ccef7e2b6e78be52e7909091cd57
-          - target: aarch64-unknown-linux-musl
-            image: ghcr.io/napi-rs/napi-rs/nodejs-rust@sha256:78c9ab1f117f8c535b93c4b91a2f19063dda6e4dba48a6187df49810625992c1
-            strip: aarch64-linux-musl-strip
-          - target: x86_64-unknown-linux-musl
-            image: ghcr.io/napi-rs/napi-rs/nodejs-rust@sha256:78c9ab1f117f8c535b93c4b91a2f19063dda6e4dba48a6187df49810625992c1
-            strip: strip
+      - name: Check Android binary size
+        if: contains(matrix.target, 'android')
+        run: ls -lh ${{ matrix.target_dir }}/lightningcss || true
 
-    name: build-${{ matrix.target }}
+  create-release:
+    name: Create Release
+    needs: build
     runs-on: ubuntu-latest
-    container:
-      image: ${{ matrix.image }}
-
+    # Tags need this permission to create a GitHub Release
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v3
-      - name: Install Node.JS
-        uses: actions/setup-node@v3
-        with:
-          node-version: 18
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Setup cross compile toolchain
-        if: ${{ matrix.setup }}
-        run: ${{ matrix.setup }}
-
-      - name: Setup rust target
-        run: rustup target add ${{ matrix.target }}
-
-      - uses: bahmutov/npm-install@v1.8.32
-      - name: Build release
-        run: yarn build-release
-        env:
-          RUST_TARGET: ${{ matrix.target }}
-      - name: Build CLI
-        run: |
-          yarn napi build --bin lightningcss --release --features cli --target ${{ matrix.target }}
-          mv target/${{ matrix.target }}/release/lightningcss lightningcss
-      - name: Strip debug symbols # https://github.com/rust-lang/rust/issues/46034
-        if: ${{ matrix.strip }}
-        run: ${{ matrix.strip }} *.node lightningcss
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: bindings-${{ matrix.target }}
-          path: |
-            *.node
-            lightningcss
-
-  build-freebsd:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v3
-      - name: Build FreeBSD
-        uses: cross-platform-actions/action@v0.25.0
-        env:
-          DEBUG: napi:*
-          RUSTUP_HOME: /usr/local/rustup
-          CARGO_HOME: /usr/local/cargo
-          RUSTUP_IO_THREADS: 1
-        with:
-          operating_system: freebsd
-          version: '14.0'
-          memory: 13G
-          cpu_count: 3
-          environment_variables: 'DEBUG RUSTUP_IO_THREADS'
-          shell: bash
-          run: |
-            sudo pkg install -y -f curl node libnghttp2 npm yarn
-            curl https://sh.rustup.rs -sSf --output rustup.sh
-            sh rustup.sh -y --profile minimal --default-toolchain beta
-            source "$HOME/.cargo/env"
-            echo "~~~~ rustc --version ~~~~"
-            rustc --version
-            echo "~~~~ node -v ~~~~"
-            node -v
-            echo "~~~~ yarn --version ~~~~"
-            yarn --version
-            yarn install || true
-            yarn build-release
-            strip -x *.node
-            cargo build --release --features cli
-            mv target/release/lightningcss lightningcss
-            node -e "require('.')"
-            ./lightningcss --help
-            rm -rf node_modules
-            rm -rf target
-            rm -rf .yarn/cache
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: bindings-x86_64-unknown-freebsd
-          path: |
-            *.node
-            lightningcss
-
-  build-wasm:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v3
-      - name: Install Node.JS
-        uses: actions/setup-node@v3
-        with:
-          node-version: 18
-      - uses: bahmutov/npm-install@v1.8.32
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
-      - name: Setup rust target
-        run: rustup target add wasm32-unknown-unknown
-      - name: Install wasm-opt
-        run: |
-          curl -L -O https://github.com/WebAssembly/binaryen/releases/download/version_111/binaryen-version_111-x86_64-linux.tar.gz
-          tar -xf binaryen-version_111-x86_64-linux.tar.gz
-      - name: Build wasm
-        run: |
-          export PATH="$PATH:./binaryen-version_111/bin"
-          yarn wasm:build-release
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: wasm
-          path: wasm/lightningcss_node.wasm
-
-  release:
-    runs-on: ubuntu-latest
-    name: Build and release
-    needs:
-      - build
-      - build-linux
-      - build-apple-silicon
-      - build-freebsd
-      - build-wasm
-    steps:
-      - uses: actions/checkout@v3
-      - uses: bahmutov/npm-install@v1.8.32
-      - name: Download artifacts
+      - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
-      - name: Show artifacts
-        run: ls -R artifacts
-      - name: Build npm packages
+
+      - name: Display artifacts structure
         run: |
-          node scripts/build-npm.js
-          cp artifacts/wasm/* wasm/.
-          node scripts/build-wasm.js
-      - run: echo //registry.npmjs.org/:_authToken=${NPM_TOKEN} > ~/.npmrc
+          find artifacts -type f | sort
+
+      - name: Move artifacts
+        run: |
+          mkdir -p release
+          mkdir -p bin
+          
+          # Collect node addons
+          find artifacts/lightningcss-addon-* -name "lightningcss.*.node" -exec cp {} release/ \;
+          
+          # Collect binaries
+          for PLATFORM in win32-x64 win32-arm64 linux-x64 linux-arm64 linux-musl-x64 linux-musl-arm64 darwin-x64 darwin-arm64 android-arm64 android-arm; do
+            if [ -f "artifacts/lightningcss-bin-$PLATFORM/lightningcss" ]; then
+              cp "artifacts/lightningcss-bin-$PLATFORM/lightningcss" "bin/lightningcss-$PLATFORM"
+            elif [ -f "artifacts/lightningcss-bin-$PLATFORM/lightningcss.exe" ]; then
+              cp "artifacts/lightningcss-bin-$PLATFORM/lightningcss.exe" "bin/lightningcss-$PLATFORM.exe"
+            fi
+          done
+          
+          echo "Release directory contents:"
+          ls -la release/
+          echo "Bin directory contents:"
+          ls -la bin/
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+
+      - name: Setup .npmrc
+        run: echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" >> ~/.npmrc
         env:
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-      - name: Publish to npm
-        run: |
-          for pkg in npm/*; do
-            echo "Publishing $pkg..."
-            cd $pkg;
-            npm publish;
-            cd ../..;
-          done
-          cd wasm
-          echo "Publishing lightningcss-wasm...";
-          npm publish
-          cd ..
-          cd cli
-          echo "Publishing lightningcss-cli...";
-          npm publish
-          cd ..
-          echo "Publishing lightningcss...";
-          npm publish
 
-  release-crates:
-    runs-on: ubuntu-latest
-    name: Release Rust crate
-    steps:
-      - uses: actions/checkout@v3
-      - uses: bahmutov/npm-install@v1.8.32
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-      - run: cargo login ${CRATES_IO_TOKEN}
+      - name: Set version
+        run: node scripts/set-version.js
         env:
-          CRATES_IO_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
-      - run: |
-          cargo install cargo-workspaces
-          cargo workspaces publish --no-remove-dev-deps --from-git -y
+          VERSION: ${{ github.event.inputs.version || github.ref_name }}
+
+      - name: Publish
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Create GitHub Release
+        id: create_release
+        uses: softprops/action-gh-release@v1
+        with:
+          name: Release ${{ github.event.inputs.tag || github.ref_name }}
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: |
+            bin/lightningcss-*
+            release/lightningcss.*.node
+          body: "Release ${{ github.event.inputs.tag || github.ref_name }}"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
